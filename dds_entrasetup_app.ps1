@@ -9,11 +9,9 @@
 # - Backend/API app registration for Oracle Database
 # - Backend App ID URI: api://<backend-application-id>
 # - Backend delegated scope: session:scope:connect
-# - Backend optional ID token claim: upn
 # - Backend Deep Data Security app roles: EMPLOYEE, MANAGER
 # - Frontend/client app registration that authenticates users
 # - User token scope used by DeepsecNoOBO_app.java: api://<backend-application-id>/session:scope:connect
-# - Frontend delegated scope kept for the client app itself: access_as_user
 # - Frontend redirect URI used by DeepsecNoOBO_app.java: http://localhost:8080/callback
 # - Frontend client secret used by DeepsecNoOBO_app.java for client credentials
 # - Frontend API permission to call the backend session:scope:connect scope
@@ -53,12 +51,6 @@ param(
     [string]$ScopeDisplayName = "Connect to Oracle Database",
 
     [string]$ScopeDescription = "Allows users to connect to Oracle Database.",
-
-    [string]$ClientUserScopeName = "access_as_user",
-
-    [string]$ClientUserScopeDisplayName = "Access DeepsecNoOBO app",
-
-    [string]$ClientUserScopeDescription = "Allows users to sign in to the DeepsecNoOBO app.",
 
     # Deep Data Security roles exposed by the app registration.
     [string[]]$DataRoleValues = @("EMPLOYEE", "MANAGER"),
@@ -109,10 +101,7 @@ param(
 
     [string]$UserLookupLogPath = "",
 
-    # The upn optional claim requires Microsoft Graph delegated profile permission.
-    [string[]]$OptionalClaimMicrosoftGraphDelegatedScopes = @("profile"),
-
-    [string[]]$ClientMicrosoftGraphDelegatedScopes = @("openid", "profile", "email"),
+    [string[]]$ClientMicrosoftGraphDelegatedScopes = @(),
 
     [string]$ClientSecretDisplayName = "DeepsecNoOBO_app",
 
@@ -1386,15 +1375,6 @@ function Set-RequiredResourceAccessForSelf {
             }
 
             if ("$($entry.ResourceAppId)" -eq $microsoftGraphAppId) {
-                if ($entry.ResourceAccess) {
-                    foreach ($access in $entry.ResourceAccess) {
-                        Add-ResourceAccessIfMissing `
-                            -ResourceAccess $microsoftGraphResourceAccess `
-                            -AccessId "$($access.Id)" `
-                            -AccessType "$($access.Type)"
-                    }
-                }
-
                 continue
             }
 
@@ -1450,6 +1430,75 @@ function Set-RequiredResourceAccessForSelf {
         -Body @{
             requiredResourceAccess = @($requiredResourceAccess.ToArray())
         }
+}
+
+function Remove-MicrosoftGraphDelegatedScopes {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Application,
+
+        [string[]]$ScopeNames = @()
+    )
+
+    $scopeNamesToRemove = @($ScopeNames |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { $_.Trim() } |
+        Select-Object -Unique)
+
+    if ($scopeNamesToRemove.Count -eq 0) {
+        return $Application
+    }
+
+    $microsoftGraphAppId = "00000003-0000-0000-c000-000000000000"
+    $scopeAccessToRemove = @(Get-MicrosoftGraphDelegatedScopeAccess -ScopeNames $scopeNamesToRemove)
+    $scopeAccessKeysToRemove = @($scopeAccessToRemove | ForEach-Object {
+        $accessId = "$(Get-GraphProperty -InputObject $_ -Name "id" -Required)"
+        $accessType = "$(Get-GraphProperty -InputObject $_ -Name "type" -Required)"
+        "$($accessType.ToLowerInvariant()):$($accessId.ToLowerInvariant())"
+    })
+
+    $requiredResourceAccess = New-Object System.Collections.Generic.List[object]
+    if ($Application.RequiredResourceAccess) {
+        foreach ($entry in $Application.RequiredResourceAccess) {
+            if ("$($entry.ResourceAppId)" -ne $microsoftGraphAppId) {
+                $requiredResourceAccess.Add((ConvertTo-ResourceAccessBody -RequiredResourceAccess $entry))
+                continue
+            }
+
+            $remainingResourceAccess = New-Object System.Collections.Generic.List[object]
+            if ($entry.ResourceAccess) {
+                foreach ($access in $entry.ResourceAccess) {
+                    $accessId = "$(Get-GraphProperty -InputObject $access -Name "id")"
+                    $accessType = "$(Get-GraphProperty -InputObject $access -Name "type")"
+                    $accessKey = "$($accessType.ToLowerInvariant()):$($accessId.ToLowerInvariant())"
+                    if ($scopeAccessKeysToRemove -contains $accessKey) {
+                        continue
+                    }
+
+                    $remainingResourceAccess.Add(@{
+                        id = $accessId
+                        type = $accessType
+                    })
+                }
+            }
+
+            if ($remainingResourceAccess.Count -gt 0) {
+                $requiredResourceAccess.Add(@{
+                    resourceAppId = $microsoftGraphAppId
+                    resourceAccess = @($remainingResourceAccess.ToArray())
+                })
+            }
+        }
+    }
+
+    Write-Host "Removing unused Microsoft Graph delegated scopes from $($Application.DisplayName): $($scopeNamesToRemove -join ', ')"
+    Invoke-GraphPatch `
+        -Uri "https://graph.microsoft.com/v1.0/applications/$($Application.Id)" `
+        -Body @{
+            requiredResourceAccess = @($requiredResourceAccess.ToArray())
+        }
+
+    return Get-MgApplication -ApplicationId $Application.Id
 }
 
 function ConvertTo-PreAuthorizedApplicationBody {
@@ -1602,19 +1651,69 @@ function Set-ClientApplicationRedirectUris {
     return Get-MgApplication -ApplicationId $ClientApplication.Id
 }
 
-function Set-ClientUserAccessScope {
+function ConvertTo-OptionalClaimBody {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Claim
+    )
+
+    $body = @{
+        name = "$(Get-GraphProperty -InputObject $Claim -Name "name" -Required)"
+        essential = [bool](Get-GraphProperty -InputObject $Claim -Name "essential")
+        additionalProperties = @()
+    }
+
+    $source = Get-GraphProperty -InputObject $Claim -Name "source"
+    if ($null -ne $source) {
+        $body.source = $source
+    }
+
+    $additionalProperties = Get-GraphProperty `
+        -InputObject $Claim `
+        -Name "additionalProperties"
+    if ($additionalProperties) {
+        $body.additionalProperties = @($additionalProperties)
+    }
+
+    return $body
+}
+
+function Get-OptionalClaimBodiesWithoutName {
+    param(
+        [AllowNull()]
+        [object[]]$Claims,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ClaimName
+    )
+
+    $bodies = New-Object System.Collections.Generic.List[object]
+    if ($Claims) {
+        foreach ($claim in @($Claims)) {
+            if ($null -eq $claim) {
+                continue
+            }
+
+            $name = Get-GraphProperty -InputObject $claim -Name "name"
+            if ($name -and "$name" -eq $ClaimName) {
+                continue
+            }
+
+            $bodies.Add((ConvertTo-OptionalClaimBody -Claim $claim))
+        }
+    }
+
+    return @($bodies.ToArray())
+}
+
+function Remove-ClientApplicationApiExposure {
     param(
         [Parameter(Mandatory = $true)]
         [object]$ClientApplication,
 
-        [Parameter(Mandatory = $true)]
-        [string]$ScopeName,
+        [string]$ScopeName = "access_as_user",
 
-        [Parameter(Mandatory = $true)]
-        [string]$ScopeDisplayName,
-
-        [Parameter(Mandatory = $true)]
-        [string]$ScopeDescription
+        [string]$OptionalClaimName = "upn"
     )
 
     $clientAppIdUri = "api://$($ClientApplication.AppId)"
@@ -1624,55 +1723,65 @@ function Set-ClientUserAccessScope {
         $existingClientScopes = @(Get-GraphProperty -InputObject $clientApi -Name "oauth2PermissionScopes")
     }
 
-    $existingScope = Get-ExistingScope `
-        -Scopes $existingClientScopes `
-        -ScopeName $ScopeName
-
-    $clientScope = New-OracleDatabaseScope `
-        -ExistingScope $existingScope `
-        -ScopeName $ScopeName `
-        -ScopeDisplayName $ScopeDisplayName `
-        -ScopeDescription $ScopeDescription
-
     $scopeBodies = New-Object System.Collections.Generic.List[object]
     if ($existingClientScopes) {
         foreach ($scope in @($existingClientScopes)) {
             $scopeValue = Get-GraphProperty -InputObject $scope -Name "value"
-            if ($scopeValue -and "$scopeValue" -ne $ScopeName) {
-                $scopeBodies.Add((ConvertTo-OAuth2PermissionScopeBody -Scope $scope))
+            if ($scopeValue -and "$scopeValue" -eq $ScopeName) {
+                continue
             }
+
+            $scopeBodies.Add((ConvertTo-OAuth2PermissionScopeBody -Scope $scope))
         }
     }
-    $scopeBodies.Add($clientScope)
 
-    Write-Host "Configuring frontend user access scope: $clientAppIdUri/$ScopeName"
+    $identifierUris = New-Object System.Collections.Generic.List[string]
+    foreach ($identifierUri in @($ClientApplication.IdentifierUris)) {
+        if ([string]::IsNullOrWhiteSpace("$identifierUri")) {
+            continue
+        }
+
+        if ($scopeBodies.Count -eq 0 -and "$identifierUri" -eq $clientAppIdUri) {
+            continue
+        }
+
+        $identifierUris.Add("$identifierUri")
+    }
+
+    $optionalClaims = Get-GraphProperty `
+        -InputObject $ClientApplication `
+        -Name "optionalClaims"
+    $idTokenClaims = @()
+    $accessTokenClaims = @()
+    $saml2TokenClaims = @()
+    if ($optionalClaims) {
+        $idTokenClaims = @(Get-GraphProperty -InputObject $optionalClaims -Name "idToken")
+        $accessTokenClaims = @(Get-GraphProperty -InputObject $optionalClaims -Name "accessToken")
+        $saml2TokenClaims = @(Get-GraphProperty -InputObject $optionalClaims -Name "saml2Token")
+    }
+
+    Write-Host "Removing unused frontend API exposure: $clientAppIdUri/$ScopeName"
     Invoke-GraphPatch `
         -Uri "https://graph.microsoft.com/v1.0/applications/$($ClientApplication.Id)" `
         -Body @{
-            identifierUris = @($clientAppIdUri)
+            identifierUris = @($identifierUris.ToArray())
             api = @{
-                requestedAccessTokenVersion = 2
                 oauth2PermissionScopes = @($scopeBodies.ToArray())
             }
             optionalClaims = @{
-                idToken = @(
-                    @{
-                        name = "upn"
-                        essential = $false
-                        additionalProperties = @()
-                    }
-                )
-                accessToken = @()
-                saml2Token = @()
+                idToken = @(Get-OptionalClaimBodiesWithoutName `
+                    -Claims $idTokenClaims `
+                    -ClaimName $OptionalClaimName)
+                accessToken = @(Get-OptionalClaimBodiesWithoutName `
+                    -Claims $accessTokenClaims `
+                    -ClaimName $OptionalClaimName)
+                saml2Token = @(Get-OptionalClaimBodiesWithoutName `
+                    -Claims $saml2TokenClaims `
+                    -ClaimName $OptionalClaimName)
             }
         }
 
-    $updatedClientApplication = Get-MgApplication -ApplicationId $ClientApplication.Id
-    return @{
-        Application = $updatedClientApplication
-        AppIdUri = $clientAppIdUri
-        Scope = $clientScope
-    }
+    return Get-MgApplication -ApplicationId $ClientApplication.Id
 }
 
 function Ensure-ClientApplicationSecret {
@@ -1792,15 +1901,6 @@ function Set-ClientRequiredResourceAccess {
             }
 
             if ("$($entry.ResourceAppId)" -eq $microsoftGraphAppId) {
-                if ($entry.ResourceAccess) {
-                    foreach ($access in $entry.ResourceAccess) {
-                        Add-ResourceAccessIfMissing `
-                            -ResourceAccess $microsoftGraphResourceAccess `
-                            -AccessId "$($access.Id)" `
-                            -AccessType "$($access.Type)"
-                    }
-                }
-
                 continue
             }
 
@@ -2299,8 +2399,8 @@ else {
     $appIdUri = "api://$($application.AppId)"
 }
 
-# Step 3: Publish the delegated Oracle Database connect scope and request upn
-# as an ID token optional claim. Oracle uses this App ID URI with v2 tokens.
+# Step 3: Publish the delegated Oracle Database connect scope. Oracle uses
+# this App ID URI with v2 tokens.
 $existingScope = Get-ExistingScope `
     -Scopes $application.Api.Oauth2PermissionScopes `
     -ScopeName $ScopeName
@@ -2325,7 +2425,19 @@ if ($applicationApi) {
     }
 }
 
-Write-Host "Configuring App ID URI, scope, optional claim, and token version..."
+$backendOptionalClaims = Get-GraphProperty `
+    -InputObject $application `
+    -Name "optionalClaims"
+$backendIdTokenClaims = @()
+$backendAccessTokenClaims = @()
+$backendSaml2TokenClaims = @()
+if ($backendOptionalClaims) {
+    $backendIdTokenClaims = @(Get-GraphProperty -InputObject $backendOptionalClaims -Name "idToken")
+    $backendAccessTokenClaims = @(Get-GraphProperty -InputObject $backendOptionalClaims -Name "accessToken")
+    $backendSaml2TokenClaims = @(Get-GraphProperty -InputObject $backendOptionalClaims -Name "saml2Token")
+}
+
+Write-Host "Configuring App ID URI, scope, and token version..."
 Invoke-GraphPatch `
     -Uri "https://graph.microsoft.com/v1.0/applications/$($application.Id)" `
     -Body @{
@@ -2336,19 +2448,22 @@ Invoke-GraphPatch `
             preAuthorizedApplications = @($preAuthorizedApplicationsToPreserve)
         }
         optionalClaims = @{
-            idToken = @(
-                @{
-                    name = "upn"
-                    essential = $false
-                    additionalProperties = @()
-                }
-            )
-            accessToken = @()
-            saml2Token = @()
+            idToken = @(Get-OptionalClaimBodiesWithoutName `
+                -Claims $backendIdTokenClaims `
+                -ClaimName "upn")
+            accessToken = @(Get-OptionalClaimBodiesWithoutName `
+                -Claims $backendAccessTokenClaims `
+                -ClaimName "upn")
+            saml2Token = @(Get-OptionalClaimBodiesWithoutName `
+                -Claims $backendSaml2TokenClaims `
+                -ClaimName "upn")
         }
     }
 
 $application = Get-MgApplication -ApplicationId $application.Id
+$application = Remove-MicrosoftGraphDelegatedScopes `
+    -Application $application `
+    -ScopeNames @("profile")
 
 # Step 4: Create or reuse the frontend/client app. This app authenticates users
 # and requests the backend API scope: api://<backend-app-id>/session:scope:connect.
@@ -2369,14 +2484,9 @@ $clientApplication = Set-ClientApplicationRedirectUris `
     -ApplicationType $ClientApplicationType `
     -RedirectUris $ClientRedirectUris
 
-$clientUserScopeResult = Set-ClientUserAccessScope `
+$clientApplication = Remove-ClientApplicationApiExposure `
     -ClientApplication $clientApplication `
-    -ScopeName $ClientUserScopeName `
-    -ScopeDisplayName $ClientUserScopeDisplayName `
-    -ScopeDescription $ClientUserScopeDescription
-$clientApplication = $clientUserScopeResult["Application"]
-$clientAppIdUri = $clientUserScopeResult["AppIdUri"]
-$clientUserScope = $clientUserScopeResult["Scope"]
+    -ScopeName "access_as_user"
 
 $clientApplication = Set-ClientRequiredResourceAccess `
     -ClientApplication $clientApplication `
@@ -2479,13 +2589,7 @@ if (-not $SkipDeepDataSecuritySettings) {
         -BackendScopeId "$($oracleScope.id)" `
         -MicrosoftGraphDelegatedScopeNames $ClientMicrosoftGraphDelegatedScopes
 
-    # Step 6: Add the Microsoft Graph delegated profile permission required by
-    # the upn claim UI. DDS app roles are assigned directly to users below.
-    Set-RequiredResourceAccessForSelf `
-        -Application $application `
-        -MicrosoftGraphDelegatedScopeNames $OptionalClaimMicrosoftGraphDelegatedScopes
-
-    # Step 7: Ensure the backend enterprise application exists and appears in the
+    # Step 6: Ensure the backend enterprise application exists and appears in the
     # default Enterprise Applications portal filter.
     $application = Get-MgApplication -ApplicationId $application.Id
     $servicePrincipal = Ensure-EntraServicePrincipal -AppId $application.AppId
@@ -2506,7 +2610,7 @@ if (-not $SkipDeepDataSecuritySettings) {
         -Name "id" `
         -Required
 
-    # Step 8: Remove any stale frontend service principal role assignments left
+    # Step 7: Remove any stale frontend service principal role assignments left
     # by older script versions. The app-only DB token should be role-free.
     Remove-EntraAppRoleAssignments `
         -PrincipalCollection "servicePrincipals" `
@@ -2514,7 +2618,7 @@ if (-not $SkipDeepDataSecuritySettings) {
         -ResourceServicePrincipalId $servicePrincipalObjectIdForAssignments `
         -AppRoles $ddsAppRoles
 
-    # Step 9: Create or reuse demo users, then assign DDS roles directly:
+    # Step 8: Create or reuse demo users, then assign DDS roles directly:
     # emma -> EMPLOYEE and marvin -> MANAGER by default.
     $employeeUserResult = Ensure-DdsUserRoleAssignment `
         -UserName $EmployeeUserName `
@@ -2566,16 +2670,10 @@ if (-not $SkipDeepDataSecuritySettings) {
     }
 }
 else {
-    # Even without DDS roles, keep the upn optional claim's Graph profile
-    # permission in sync so the token configuration warning is avoided.
-    Set-RequiredResourceAccessForSelf `
-        -Application $application `
-        -MicrosoftGraphDelegatedScopeNames $OptionalClaimMicrosoftGraphDelegatedScopes
-
     $application = Get-MgApplication -ApplicationId $application.Id
 }
 
-# Step 10: Write Oracle configuration artifacts. Oracle checks application_id
+# Step 9: Write Oracle configuration artifacts. Oracle checks application_id
 # against the token aud claim. With api://<app-id>/.default, Entra v2 still
 # emits the backend application ID GUID as aud, so application_id stays GUID
 # while application_id_uri stays api://<backend-application-id>.
@@ -2630,10 +2728,6 @@ if ($managerUser) {
 }
 
 $ddsAssignmentSummary = $ddsAssignments.ToArray() -join ","
-$optionalClaimMicrosoftGraphDelegatedScopeSummary = @($OptionalClaimMicrosoftGraphDelegatedScopes |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-    ForEach-Object { $_.Trim() } |
-    Select-Object -Unique) -join ","
 $clientRedirectUriSummary = @($ClientRedirectUris |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
     ForEach-Object { $_.Trim() } |
@@ -2652,7 +2746,6 @@ $clientMicrosoftGraphDelegatedScopeSummary = @($ClientMicrosoftGraphDelegatedSco
     ForEach-Object { $_.Trim() } |
     Select-Object -Unique) -join ","
 $clientRequestedScope = "$appIdUri/$ScopeName"
-$clientUserAccessScope = "$clientAppIdUri/$ClientUserScopeName"
 $backendDefaultScope = "$appIdUri/.default"
 $clientSecretCreated = [bool]$clientSecretResult["Created"]
 $clientSecretValue = "$($clientSecretResult["SecretText"])"
@@ -2689,8 +2782,6 @@ Scope=$clientRequestedScope
 ScopeName=$ScopeName
 ScopeId=$($oracleScope.id)
 RequestedAccessTokenVersion=2
-OptionalIdTokenClaim=upn
-OptionalClaimMicrosoftGraphDelegatedScopes=$optionalClaimMicrosoftGraphDelegatedScopeSummary
 
 [Frontend Client Application]
 DisplayName=$ClientDisplayName
@@ -2700,7 +2791,6 @@ ApplicationType=$ClientApplicationType
 RedirectUris=$clientRedirectUriSummary
 CallbackPort=8080
 RequestedBackendScope=$clientRequestedScope
-UserAccessScope=$clientUserAccessScope
 UserTokenScope=$clientRequestedScope
 MicrosoftGraphDelegatedScopes=$clientMicrosoftGraphDelegatedScopeSummary
 ServicePrincipalObjectId=$clientServicePrincipalObjectId
@@ -2799,16 +2889,12 @@ Add-Content -Path $SetupLogPath -Value $pythonConfigureEnvironmentContent -Encod
     BackendScopeName                          = $ScopeName
     BackendScopeId                            = $oracleScope.id
     BackendRequestedAccessTokenVersion        = 2
-    BackendOptionalIdTokenClaim               = "upn"
-    OptionalClaimMicrosoftGraphDelegatedScopes = $optionalClaimMicrosoftGraphDelegatedScopeSummary
     FrontendDisplayName                       = $ClientDisplayName
     FrontendAppId                             = $clientApplication.AppId
     FrontendAppObjectId                       = $clientApplication.Id
-    FrontendAppIdUri                          = $clientAppIdUri
     FrontendApplicationType                   = $ClientApplicationType
     FrontendRedirectUris                      = $clientRedirectUriSummary
     FrontendRequestedBackendScope             = $clientRequestedScope
-    FrontendUserAccessScope                   = $clientUserAccessScope
     FrontendMicrosoftGraphDelegatedScopes     = $clientMicrosoftGraphDelegatedScopeSummary
     FrontendClientSecretStatus                = $clientSecretStatus
     FrontendClientSecretKeyId                 = $clientSecretKeyId
